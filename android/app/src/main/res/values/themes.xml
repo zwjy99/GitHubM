@@ -26,7 +26,7 @@
       ══ 底部导航栏 M3 样式 ══════════════════════════════════════════
 
       BottomNavTextActive / BottomNavTextInactive
-        紧凑规格：10sp，图标与文字间距更小，整体高度更紧凑。
+        使用稳定的 11sp 标签，与 80dp 的 BottomNavigationView 配合，减少大字体下图标/文字重叠。
         选中与未选中使用相同字号，靠颜色区分；选中加粗增强层次感。
     -->
     <!--
@@ -42,12 +42,12 @@
         导致整个 TextAppearance 回退、标签消失
     -->
     <style name="BottomNavTextActive" parent="TextAppearance.Material3.LabelSmall">
-        <item name="android:textSize">10sp</item>
+        <item name="android:textSize">11sp</item>
         <item name="android:textStyle">bold</item>
     </style>
 
     <style name="BottomNavTextInactive" parent="TextAppearance.Material3.LabelSmall">
-        <item name="android:textSize">10sp</item>
+        <item name="android:textSize">11sp</item>
         <item name="android:textStyle">normal</item>
     </style>
 

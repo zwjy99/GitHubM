@@ -14,6 +14,13 @@ import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.provider.DocumentsContract
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import android.provider.Settings
 import android.util.Base64
 import android.view.View
 import android.webkit.JavascriptInterface
@@ -49,6 +56,7 @@ import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
+    @Volatile private var localAssetPageActive = false
     private lateinit var webView: WebView
     private lateinit var splashOverlay: View
     private lateinit var bottomNav: BottomNavigationView
@@ -63,6 +71,54 @@ class MainActivity : AppCompatActivity() {
     private var splashMinTimeReached = false
     /** true = React 首屏已就绪（notifyReady 已回调） */
     private var webViewReadyReceived = false
+    /** Native OAuth completion may arrive before the WebView has mounted its listener. */
+    private var pendingOAuthEventJs: String? = null
+    /** Native share/deep links may arrive before React and the login guard finish mounting. */
+    private var pendingRepositoryPath: String? = null
+
+    private fun repositoryPathFromText(value: String): String? {
+        // Only GitHub repo pages; never execute arbitrary fragments, JS or external URLs.
+        val candidate = Regex("https?://(?:www\\.)?github\\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+(?:[/?#\\s]|$)", RegexOption.IGNORE_CASE)
+            .find(value)?.value?.trimEnd(' ', '/', '?', '#', '\n')
+        val uri = runCatching {
+            if (value.startsWith("githubm://repo/")) Uri.parse(value) else Uri.parse(candidate ?: return null)
+        }.getOrNull() ?: return null
+        val parts = uri.pathSegments
+        val owner = if (uri.scheme == "githubm" && uri.host == "repo") parts.getOrNull(0) else parts.getOrNull(0)
+        val name = parts.getOrNull(1)?.removeSuffix(".git")
+        if (uri.scheme == "githubm" && uri.host != "repo") return null
+        if (uri.scheme != "githubm" && (uri.scheme != "https" && uri.scheme != "http" || uri.host !in listOf("github.com", "www.github.com"))) return null
+        if (owner.isNullOrEmpty() || name.isNullOrEmpty() || !Regex("[A-Za-z0-9-]{1,39}").matches(owner) ||
+            !Regex("[A-Za-z0-9._-]{1,100}").matches(name) || name == "." || name == "..") return null
+        // Reject common GitHub site-level routes that are not repositories.
+        if (owner.lowercase() in setOf("settings", "login", "signup", "features", "topics", "organizations", "marketplace", "explore", "search")) return null
+        return "/repos/$owner/$name"
+    }
+
+    private fun dispatchPendingRepositoryPath() {
+        if (!webViewReadyReceived || !::webView.isInitialized || webView.url?.startsWith("file:///android_asset/index.html") != true) return
+        val path = pendingRepositoryPath ?: return
+        pendingRepositoryPath = null
+        val detail = org.json.JSONObject.quote(path)
+        webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('githubm:open-repository',{detail:$detail}));", null)
+    }
+
+    private val githubOAuth by lazy {
+        GithubOAuthNative(this) { token, error ->
+            val detail = org.json.JSONObject().put("token", token ?: org.json.JSONObject.NULL)
+                .put("error", error ?: org.json.JSONObject.NULL).toString()
+            pendingOAuthEventJs = "window.dispatchEvent(new CustomEvent('githubm:oauth-result',{detail:$detail}));"
+            dispatchPendingOAuthEvent()
+        }
+    }
+
+    private fun dispatchPendingOAuthEvent() {
+        if (!webViewReadyReceived || !::webView.isInitialized) return
+        val js = pendingOAuthEventJs ?: return
+        if (webView.url?.startsWith("file:///android_asset/index.html") != true) return
+        pendingOAuthEventJs = null
+        webView.evaluateJavascript(js, null)
+    }
     /** 启动画面专用 Handler：管理打字动画、光标闪烁、定时任务 */
     private val splashHandler = Handler(Looper.getMainLooper())
     /** 光标闪烁 Runnable，dismissSplash 时停止 */
@@ -98,19 +154,107 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         val uris: Array<Uri>? = if (result.resultCode == RESULT_OK) {
-            result.data?.let { data ->
-                when {
-                    data.clipData != null ->
-                        Array(data.clipData!!.itemCount) { i ->
-                            data.clipData!!.getItemAt(i).uri
-                        }
-                    data.data != null -> arrayOf(data.data!!)
-                    else -> cameraImageUri?.let { arrayOf(it) }
-                }
+            val data = result.data
+            when {
+                data?.clipData != null -> Array(data.clipData!!.itemCount) { i -> data.clipData!!.getItemAt(i).uri }
+                data?.data != null -> arrayOf(data.data!!)
+                else -> cameraImageUri?.let { arrayOf(it) }
             }
         } else null
         fileChooserCallback?.onReceiveValue(uris)
         fileChooserCallback = null
+        cameraImageUri = null
+    }
+
+    // SAF DocumentsProvider directory import. Prepare a bounded, temporary ZIP
+    // in private cache; no broad external storage permissions are requested.
+    private val stagedFolderZips = mutableMapOf<String, File>()
+    private val sourceFolderLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode != RESULT_OK || result.data?.data == null) {
+            dispatchSourceFolderResult(org.json.JSONObject().put("cancelled", true))
+        } else {
+            val tree = result.data!!.data!!
+            lifecycleScope.launch {
+                val response = try {
+                    withContext(Dispatchers.IO) { createSafSourceZip(tree) }
+                } catch (e: Exception) {
+                    org.json.JSONObject().put("error", e.message ?: "无法读取文件夹")
+                }
+                dispatchSourceFolderResult(response)
+            }
+        }
+    }
+
+    private fun dispatchSourceFolderResult(response: org.json.JSONObject) {
+        if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return
+        webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('githubm:source-folder-ready',{detail:${response}}));", null)
+    }
+
+    private fun createSafSourceZip(tree: Uri): org.json.JSONObject {
+        val tmp = File.createTempFile("githubm-saf-", ".zip", cacheDir)
+        val id = UUID.randomUUID().toString()
+        var files = 0
+        var expandedBytes = 0L
+        try {
+            FileOutputStream(tmp).use { output ->
+                ZipOutputStream(output).use { zip ->
+                    fun scan(parentId: String, prefix: String, depth: Int) {
+                        if (depth > 20) throw IOException("文件夹层级超过安全上限")
+                        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+                        contentResolver.query(childrenUri, arrayOf(
+                            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                            DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        ), null, null, null)?.use { cursor ->
+                            while (cursor.moveToNext()) {
+                                val documentId = cursor.getString(0) ?: continue
+                                val rawName = cursor.getString(1) ?: continue
+                                val mime = cursor.getString(2) ?: ""
+                                if (rawName == "." || rawName == ".." || rawName.contains('/') || rawName.contains('\\') || rawName.any { it.code < 32 }) continue
+                                val path = prefix + rawName
+                                if (path.length > 400) continue
+                                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                                    if (rawName in setOf(".git", "node_modules", "build", "dist", "target", ".gradle")) continue
+                                    scan(documentId, "$path/", depth + 1)
+                                } else {
+                                    files++
+                                    if (files > 1500) throw IOException("文件超过 1500 个，请拆分目录导入")
+                                    val itemUri = DocumentsContract.buildDocumentUriUsingTree(tree, documentId)
+                                    zip.putNextEntry(ZipEntry(path))
+                                    var itemBytes = 0L
+                                    contentResolver.openInputStream(itemUri)?.use { input ->
+                                        val buf = ByteArray(64 * 1024)
+                                        while (true) {
+                                            val count = input.read(buf)
+                                            if (count < 0) break
+                                            itemBytes += count
+                                            expandedBytes += count
+                                            if (itemBytes > 32L * 1024 * 1024 || expandedBytes > 160L * 1024 * 1024) throw IOException("文件或整个目录超过移动端安全上限")
+                                            zip.write(buf, 0, count)
+                                        }
+                                    } ?: throw IOException("第三方文件管理器拒绝读取 $path")
+                                    zip.closeEntry()
+                                    zip.flush()
+                                    if (tmp.length() > 96L * 1024 * 1024) throw IOException("压缩文件超过 96MB，请分批选择较小的目录")
+                                }
+                            }
+                        } ?: throw IOException("所选文件提供器不支持浏览该文件夹")
+                    }
+                    scan(DocumentsContract.getTreeDocumentId(tree), "", 0)
+                }
+            }
+            if (files == 0) throw IOException("文件夹为空或全部是缓存目录")
+            if (tmp.length() > 96L * 1024 * 1024) throw IOException("压缩文件超过 96MB")
+            synchronized(stagedFolderZips) {
+                stagedFolderZips.values.forEach { it.delete() }
+                stagedFolderZips.clear()
+                stagedFolderZips[id] = tmp
+            }
+            return org.json.JSONObject().put("id", id).put("size", tmp.length()).put("files", files)
+        } catch (error: Exception) {
+            tmp.delete()
+            throw error
+        }
     }
 
     // ── 按需权限：相机 ──────────────────────────────────────────────
@@ -156,14 +300,231 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Only one on-device package scan at a time; results are delivered to the local WebView. */
+    private var installedAppsScanRunning = false
+
     // ── JS 桥接口 ───────────────────────────────────────────────────
+    private var remoteApkInspectionRunning = false
+    private val remoteApkCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Android's normal resolver is the source of truth. Do not build an
+     * explicit list of components: visibility rules can make it falsely empty
+     * and force a blank chooser. Do not persist any preferred app selection.
+     */
+    private fun chooseExternalApp(uri: Uri) {
+        val view = Intent(Intent.ACTION_VIEW, uri).apply { addCategory(Intent.CATEGORY_BROWSABLE) }
+        val chooser = Intent.createChooser(view, "选择打开方式（仅本次）")
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
+            // The only recursion to avoid is selecting this WebView as its own
+            // external handler. Other browsers and clients stay in the resolver.
+            val own = packageManager.queryIntentActivities(view, 0)
+                .mapNotNull { it.activityInfo }
+                .filter { it.packageName == packageName }
+                .map { android.content.ComponentName(it.packageName, it.name) }
+                .distinct()
+            if (own.isNotEmpty()) {
+                chooser.putExtra(Intent.EXTRA_EXCLUDE_COMPONENTS, own.toTypedArray())
+            }
+        }
+        startActivity(chooser)
+    }
+
     inner class WebAppBridge {
+        /** Open a user-selected public URL outside the embedded WebView. */
+        @JavascriptInterface
+        fun openExternalUrl(rawUrl: String) {
+            runOnUiThread {
+                // Never expose bridge capability to a remote page.
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return@runOnUiThread
+                val uri = runCatching { Uri.parse(rawUrl) }.getOrNull() ?: return@runOnUiThread
+                if (uri.scheme !in listOf("https", "http") || uri.host.isNullOrBlank()) return@runOnUiThread
+                // One-off chooser: GitHubM must not steal every GitHub URL.
+                runCatching { chooseExternalApp(uri) }
+                    .onFailure { Toast.makeText(this@MainActivity, "找不到可用的浏览器", Toast.LENGTH_SHORT).show() }
+            }
+        }
+
+
+        /** Pick a directory from any compliant SAF DocumentsProvider, including supported third-party file managers. */
+        @JavascriptInterface
+        fun chooseSourceFolder() {
+            runOnUiThread {
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return@runOnUiThread
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                runCatching { sourceFolderLauncher.launch(intent) }
+                    .onFailure { dispatchSourceFolderResult(org.json.JSONObject().put("error", "系统没有可用的文件夹选择器")) }
+            }
+        }
+
+        /** Bounded synchronous chunks avoid sending a full 96 MB ZIP through one bridge message. */
+        @JavascriptInterface
+        fun readStagedSourceChunk(id: String, offset: Long, length: Int): String {
+            if (!localAssetPageActive || length !in 1..262144) return ""
+            val file = synchronized(stagedFolderZips) { stagedFolderZips[id] } ?: return ""
+            if (offset < 0 || offset >= file.length()) return ""
+            return runCatching {
+                RandomAccessFile(file, "r").use { data ->
+                    data.seek(offset)
+                    val size = minOf(length.toLong(), file.length() - offset).toInt()
+                    val block = ByteArray(size)
+                    data.readFully(block)
+                    Base64.encodeToString(block, Base64.NO_WRAP)
+                }
+            }.getOrDefault("")
+        }
+
+        @JavascriptInterface
+        fun releaseStagedSourceZip(id: String) {
+            synchronized(stagedFolderZips) { stagedFolderZips.remove(id)?.delete() }
+        }
+
+        /** Fetch icons for visible rows only. Bounded batches prevent huge JS bridge payloads. */
+        @JavascriptInterface
+        fun requestInstalledAppIcons(packageIdsJson: String) {
+            runOnUiThread {
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return@runOnUiThread
+                val names = runCatching { org.json.JSONArray(packageIdsJson) }.getOrNull() ?: return@runOnUiThread
+                val packages = (0 until minOf(names.length(), 24)).mapNotNull { index ->
+                    names.optString(index).takeIf { it.length in 3..255 }
+                }.distinct()
+                lifecycleScope.launch {
+                    val icons = withContext(Dispatchers.IO) {
+                        org.json.JSONObject().apply {
+                            for (name in packages) {
+                                InstalledAppsScanner.iconBase64(this@MainActivity, name)?.let { put(name, it) }
+                            }
+                        }
+                    }
+                    if (::webView.isInitialized && webView.url?.startsWith("file:///android_asset/") == true) {
+                        val safe = org.json.JSONObject.quote(icons.toString())
+                        webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('githubm:app-icons',{detail:JSON.parse($safe)}));", null)
+                    }
+                }
+            }
+        }
+
+        /** User-initiated installed-app scan; no scan runs automatically on app start. */
+        @JavascriptInterface
+        fun scanInstalledApps() {
+            runOnUiThread {
+                // Do not expose the installed-app inventory to a remotely navigated page.
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return@runOnUiThread
+                if (installedAppsScanRunning) return@runOnUiThread
+                installedAppsScanRunning = true
+                lifecycleScope.launch {
+                    val response = try {
+                        withContext(Dispatchers.IO) { InstalledAppsScanner.collect(this@MainActivity) }
+                    } catch (error: Exception) {
+                        org.json.JSONObject().put("error", error.message ?: "无法读取设备应用列表")
+                    }
+                    installedAppsScanRunning = false
+                    if (::webView.isInitialized && webView.url?.startsWith("file:///android_asset/") == true) {
+                        val literal = org.json.JSONObject.quote(response.toString())
+                        webView.evaluateJavascript(
+                            "window.dispatchEvent(new CustomEvent('githubm:installed-apps', {detail: JSON.parse($literal)}));",
+                            null
+                        )
+                    }
+                }
+            }
+        }
+
+        /** Read selected installed app's own APK clues only after user action. No upload. */
+        @JavascriptInterface
+        fun inspectInstalledApp(packageId: String) {
+            runOnUiThread {
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/") != true) return@runOnUiThread
+                lifecycleScope.launch {
+                    val response = try {
+                        withContext(Dispatchers.IO) { InstalledAppsScanner.inspectInstalledApk(this@MainActivity, packageId) }
+                    } catch (error: Exception) {
+                        org.json.JSONObject().put("packageId", packageId).put("error", error.message ?: "无法读取 APK")
+                    }
+                    if (::webView.isInitialized && webView.url?.startsWith("file:///android_asset/") == true) {
+                        val literal = org.json.JSONObject.quote(response.toString())
+                        webView.evaluateJavascript(
+                            "window.dispatchEvent(new CustomEvent('githubm:apk-evidence', {detail: JSON.parse($literal)}));", null
+                        )
+                    }
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun inspectRemoteApk(url: String, requestId: String) {
+            runOnUiThread {
+                if (!::webView.isInitialized || webView.url?.startsWith("file:///android_asset/index.html") != true) return@runOnUiThread
+                if (remoteApkInspectionRunning) {
+                    val result = org.json.JSONObject().put("requestId", requestId).put("error", "上一个 APK 验证尚在结束，请稍后重试")
+                    val literal = org.json.JSONObject.quote(result.toString())
+                    webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('githubm:remote-apk-evidence', {detail: JSON.parse($literal)}));", null)
+                    return@runOnUiThread
+                }
+                remoteApkInspectionRunning = true; remoteApkCancelled.set(false)
+                lifecycleScope.launch {
+                    val result = try {
+                        withContext(Dispatchers.IO) { ApkProvenanceVerifier.inspect(this@MainActivity, url) { remoteApkCancelled.get() } }
+                    } catch (error: Exception) { org.json.JSONObject().put("error", error.message ?: "APK 验证失败") }
+                    remoteApkInspectionRunning = false
+                    result.put("requestId", requestId)
+                    if (::webView.isInitialized && webView.url?.startsWith("file:///android_asset/index.html") == true) {
+                        val literal = org.json.JSONObject.quote(result.toString())
+                        webView.evaluateJavascript("window.dispatchEvent(new CustomEvent('githubm:remote-apk-evidence', {detail: JSON.parse($literal)}));", null)
+                    }
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun cancelRemoteApkInspection() { remoteApkCancelled.set(true) }
+
+        /** Open Android's native “Open by default / Links to open in this app” settings. */
+        @JavascriptInterface
+        fun openSupportedLinksSettings() {
+            runOnUiThread {
+                val uri = Uri.parse("package:$packageName")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS, uri))
+                        return@runOnUiThread
+                    } catch (_: Exception) {
+                        // Older vendor variants may not implement this settings Activity.
+                    }
+                }
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, uri))
+                } catch (_: Exception) {
+                    Toast.makeText(this@MainActivity, "请在系统设置的应用信息中找到默认打开", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
+        /** Start the GitHub OAuth App flow in the system browser (PKCE + state). */
+        @JavascriptInterface
+        fun startGithubAuth(clientId: String, exchangeUrl: String) {
+            runOnUiThread { githubOAuth.start(clientId, exchangeUrl) }
+        }
+
+        /** Optional per-user GitHub OAuth App login. No bundled Client ID or secret. */
+        @JavascriptInterface
+        fun startGithubAuthUserConfigured() {
+            runOnUiThread { githubOAuth.startUserConfigured() }
+        }
+
+        /** Open Android-native OAuth settings to replace or clear user-provided credentials. */
+        @JavascriptInterface
+        fun configureGithubAuthUser() {
+            runOnUiThread { githubOAuth.showUserConfiguration() }
+        }
+
 
         /** React 首屏就绪后调用，与 3s 最小时间共同触发启动遮罩淡出 */
         @JavascriptInterface
         fun notifyReady() {
             webViewReadyReceived = true
-            runOnUiThread { tryDismissSplash() }
+            runOnUiThread { tryDismissSplash(); dispatchPendingOAuthEvent(); dispatchPendingRepositoryPath() }
         }
 
         /**
@@ -719,6 +1080,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleIntent(intent: Intent) {
+        if (githubOAuth.handle(intent)) return
+        val incoming = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.dataString
+            Intent.ACTION_SEND -> if (intent.type == "text/plain") intent.getStringExtra(Intent.EXTRA_TEXT) else null
+            else -> null
+        }
+        if (incoming != null) {
+            val route = repositoryPathFromText(incoming)
+            if (route != null) {
+                // Ordinary HTTPS links may also be claimed by browsers, URLCheck, and other GitHub clients.
+                // Even if Android routed the link to GitHubM, do not force the user into our client.
+                val uri = intent.data
+                if (intent.action == Intent.ACTION_VIEW && uri?.scheme in listOf("https", "http")) {
+                    androidx.appcompat.app.AlertDialog.Builder(this)
+                        .setTitle("使用哪种方式打开 GitHub 链接？")
+                        .setMessage("可以仅本次进入 GitHubM，或选择其他浏览器与客户端。默认打开由 Android 系统设置控制。")
+                        .setPositiveButton("在 GitHubM 中打开") { _, _ ->
+                            pendingRepositoryPath = route
+                            dispatchPendingRepositoryPath()
+                        }
+                        .setNeutralButton("选择其他应用") { _, _ ->
+                            runCatching { chooseExternalApp(uri!!) }
+                                .onFailure { Toast.makeText(this, "没有找到可用的应用", Toast.LENGTH_SHORT).show() }
+                        }
+                        .setNegativeButton("取消", null)
+                        .show()
+                } else {
+                    pendingRepositoryPath = route
+                    dispatchPendingRepositoryPath()
+                }
+            } else {
+                Toast.makeText(this, "未识别到 GitHub 仓库链接", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
         if (intent.action == "ACTION_RESUME_DOWNLOAD") {
             val url = intent.getStringExtra("url") ?: return
             val fileName = intent.getStringExtra("fileName") ?: return
@@ -733,6 +1129,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        localAssetPageActive = false
+        synchronized(stagedFolderZips) { stagedFolderZips.values.forEach { it.delete() }; stagedFolderZips.clear() }
         super.onDestroy()
         splashHandler.removeCallbacksAndMessages(null)
         // webView 为 lateinit，若 onCreate 未完成初始化需防止 NPE
@@ -796,6 +1194,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                localAssetPageActive = url?.startsWith("file:///android_asset/") == true
                 android.util.Log.d("WebView", "开始加载: $url")
             }
 
@@ -817,6 +1216,9 @@ class MainActivity : AppCompatActivity() {
 
                 // 仅主 HTML 文件失败时展示 Toast 并触发兜底 dismiss（防止卡在启动画面）
                 if (request?.isForMainFrame == true) {
+                    if (url.startsWith("file://") && Uri.parse(url).path != "/android_asset/index.html") {
+                        runOnUiThread { webView.loadUrl("file:///android_asset/index.html#/app-library") }
+                    }
                     android.util.Log.e("WebView", "主页面加载失败，触发启动画面兜底关闭")
                     runOnUiThread { dismissSplash() }
                 }
@@ -829,7 +1231,11 @@ class MainActivity : AppCompatActivity() {
                 val url = request?.url?.toString() ?: return false
 
                 // 本地资源：让 WebView 自己处理
-                if (url.startsWith("file://")) return false
+                if (url.startsWith("file://")) {
+                    if (Uri.parse(url).path == "/android_asset/index.html") return false
+                    runOnUiThread { Toast.makeText(this@MainActivity, "该文档链接未能解析，已保留应用页面", Toast.LENGTH_SHORT).show() }
+                    return true
+                }
 
                 // 外部链接（http/https）：一律用系统浏览器打开，避免破坏 React 应用历史栈。
                 // 若允许 WebView 加载外部页面，React Router 的 history.state.idx
@@ -853,8 +1259,19 @@ class MainActivity : AppCompatActivity() {
                         return true
                     }
 
+                    // A link to an exact GitHub repository landing page should stay in GitHubM.
+                    // Do not intercept Issues, Releases or code subpaths: their links have
+                    // independent browser meaning and must not silently lose the subpath.
+                    val parsed = Uri.parse(url)
+                    if (parsed.host in listOf("github.com", "www.github.com") && parsed.pathSegments.size == 2) {
+                        repositoryPathFromText(url)?.let { repoPath ->
+                            pendingRepositoryPath = repoPath
+                            dispatchPendingRepositoryPath()
+                            return true
+                        }
+                    }
                     runCatching {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                        val intent = Intent(Intent.ACTION_VIEW, parsed)
                         startActivity(intent)
                     }
                     return true // 阻止 WebView 自行加载
@@ -1141,16 +1558,41 @@ class MainActivity : AppCompatActivity() {
                 isUserGesture: Boolean,
                 resultMsg: android.os.Message?,
             ): Boolean {
-                val transport = resultMsg?.obj as? WebView.WebViewTransport
-                val url = view?.hitTestResult?.extra
-                if (!url.isNullOrBlank() && (url.startsWith("http://") || url.startsWith("https://"))) {
-                    runCatching {
-                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                val message = resultMsg ?: return false
+                val transport = message.obj as? WebView.WebViewTransport ?: return false
+                // IMAGE_ANCHOR hit tests expose the image src, not its enclosing link href.
+                // Let Chromium resolve the actual requested URL in a temporary, bridge-free WebView.
+                val popup = WebView(this@MainActivity)
+                var handled = false
+                val cleanup = Runnable { popup.stopLoading(); popup.destroy() }
+                fun openRequestedUrl(url: String): Boolean {
+                    if (url == "about:blank") return false
+                    if (handled) return true
+                    handled = true
+                    val uri = Uri.parse(url)
+                    if (uri.scheme in listOf("https", "http", "mailto", "tel")) {
+                        runCatching { startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                    }
+                    popup.removeCallbacks(cleanup)
+                    popup.post(cleanup)
+                    return true
+                }
+                popup.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                        return request?.url?.toString()?.let { openRequestedUrl(it) } ?: true
+                    }
+                    @Suppress("DEPRECATION")
+                    override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                        return url?.let { openRequestedUrl(it) } ?: true
+                    }
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        url?.let { openRequestedUrl(it) }
                     }
                 }
-                // 不创建新的 WebView 实例，直接结束消息循环
-                transport?.webView = null
-                resultMsg?.sendToTarget()
+                // Also release a blank popup which never requests navigation.
+                popup.postDelayed(cleanup, 15000)
+                transport.webView = popup
+                message.sendToTarget()
                 return true
             }
 
@@ -1163,7 +1605,7 @@ class MainActivity : AppCompatActivity() {
                 fileChooserCallback = filePathCallback
 
                 val acceptTypes = fileChooserParams.acceptTypes?.toList() ?: emptyList()
-                val needsCamera = acceptTypes.any { it.contains("image") || it.isEmpty() }
+                val needsCamera = FileChooserPolicy.needsCamera(acceptTypes)
                 val cameraGranted = checkSelfPermission(Manifest.permission.CAMERA) ==
                     PackageManager.PERMISSION_GRANTED
 
@@ -1232,6 +1674,10 @@ class MainActivity : AppCompatActivity() {
     // ── 下载流程 ────────────────────────────────────────────────────
 
     private fun checkStoragePermissionAndDownload(url: String, fileName: String, token: String) {
+        // Defense in depth: never pass a GitHub token to user-configured mirrors.
+        // The downloader also restricts Authorization to official GitHub hosts.
+        val host = runCatching { Uri.parse(url).host?.lowercase() }.getOrNull()
+        val effectiveToken = if (host == "api.github.com" || host == "raw.githubusercontent.com") token else ""
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -1244,14 +1690,14 @@ class MainActivity : AppCompatActivity() {
             if (!granted) {
                 pendingDownloadUrl = url
                 pendingDownloadFileName = fileName
-                pendingDownloadToken = token
+                pendingDownloadToken = effectiveToken
                 writeStoragePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 return
             }
         }
         
         Toast.makeText(this, "准备加速下载：$fileName", Toast.LENGTH_SHORT).show()
-        startDownloadService(url, fileName, token)
+        startDownloadService(url, fileName, effectiveToken)
     }
 
     /** 启动前台下载服务，确保 APP 退到后台后下载不中断 */
@@ -1278,17 +1724,13 @@ class MainActivity : AppCompatActivity() {
         filePathCallback: ValueCallback<Array<Uri>>,
     ): Boolean {
         fileChooserCallback = filePathCallback
-        val fileIntent = runCatching { fileChooserParams.createIntent() }.getOrNull()
-            ?: Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "*/*"; addCategory(Intent.CATEGORY_OPENABLE)
-                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-            }
-        val cameraIntent = createCameraIntent()
-        val chooserIntent = Intent.createChooser(fileIntent, "选择文件或拍照").apply {
+        val fileIntent = createDocumentIntent(fileChooserParams)
+        val cameraIntent = if (FileChooserPolicy.needsCamera(fileChooserParams.acceptTypes?.toList() ?: emptyList())) createCameraIntent() else null
+        val chooserIntent = Intent.createChooser(fileIntent, if (cameraIntent != null) "选择图片或拍照" else "选择文件").apply {
             val extras = listOfNotNull(cameraIntent).toTypedArray()
             if (extras.isNotEmpty()) putExtra(Intent.EXTRA_INITIAL_INTENTS, extras)
         }
-        return runCatching { fileChooserLauncher.launch(chooserIntent); true }
+        return runCatching { fileChooserLauncher.launch(if (cameraIntent != null) chooserIntent else fileIntent); true }
             .getOrElse { fileChooserCallback = null; false }
     }
 
@@ -1297,15 +1739,23 @@ class MainActivity : AppCompatActivity() {
         filePathCallback: ValueCallback<Array<Uri>>,
     ): Boolean {
         fileChooserCallback = filePathCallback
-        val fileIntent = runCatching { fileChooserParams.createIntent() }.getOrNull()
-            ?: Intent(Intent.ACTION_GET_CONTENT).apply {
-                type = "*/*"; addCategory(Intent.CATEGORY_OPENABLE)
-                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
-            }
+        val fileIntent = createDocumentIntent(fileChooserParams)
         return runCatching {
             fileChooserLauncher.launch(Intent.createChooser(fileIntent, "选择文件"))
             true
         }.getOrElse { fileChooserCallback = null; false }
+    }
+
+    private fun createDocumentIntent(params: WebChromeClient.FileChooserParams): Intent {
+        cameraImageUri = null
+        val types = FileChooserPolicy.mimeTypes(params.acceptTypes?.toList() ?: emptyList())
+        return Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = if (types.size == 1) types.first() else "*/*"
+            if (types.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, types.toTypedArray())
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
     }
 
     private fun createCameraIntent(): Intent? = runCatching {

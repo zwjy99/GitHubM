@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 应用库的用户主动全量扫描；Android 11+ 需宽范围应用可见性。不是运行时授权。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <!-- ── 前台服务（下载保活） ───────────────────────────────────── -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -34,6 +36,17 @@
 
     <!-- ── 查询其他 App（文件选择器 / 打开下载文件） ─────────────── -->
     <queries>
+        <!-- Android 11+ requires visibility declarations to enumerate browser/URL handlers. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="http" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="content" />
@@ -64,6 +77,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation|screenLayout|uiMode"
             android:windowSoftInputMode="adjustPan">
             <!--
@@ -73,6 +87,37 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- 手动分享/外部打开 GitHub 仓库：githubm://repo/owner/name。
+                 github.com 域名并非本应用所有，不能声称已验证的 Android App Links。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="githubm" android:host="repo" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- “默认打开 > 在此应用中打开的链接” 中的候选 GitHub 域名。
+                 github.com 是第三方域名，无法由 GitHubM 自行验证。
+                 Android 12+ 通常需要用户在系统“默认打开”中手动选择/添加；
+                 不使用 autoVerify，也不能保证每台设备都会允许自动接管。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="github.com" android:pathPattern="/.*/.*" />
+                <data android:scheme="https" android:host="www.github.com" android:pathPattern="/.*/.*" />
+            </intent-filter>
+            <!-- GitHubM 自己的 OAuth 回调，必须在你注册的 GitHub OAuth App 中登记。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="githubm" android:host="oauth" />
             </intent-filter>
         </activity>
 

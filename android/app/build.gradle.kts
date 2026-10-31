@@ -84,7 +84,7 @@ android {
     // assets 目录由 CI workflow 在构建前填充（dist/ 内容）
     sourceSets {
         getByName("main") {
-            assets.srcDirs("src/main/assets")
+            assets.setSrcDirs(listOf(providers.gradleProperty("webAssetsDir").getOrElse("src/main/assets")))
         }
     }
 }

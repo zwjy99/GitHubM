@@ -81,6 +81,10 @@ jobs:
         run: pnpm install
 
       - name: 构建 Web 应用（注入版本号）
+        env:
+          # Client ID 和 Worker URL 是公开配置；严禁在此注入 OAuth Client Secret。
+          VITE_GITHUB_OAUTH_CLIENT_ID: ${{ vars.GITHUBM_OAUTH_CLIENT_ID }}
+          VITE_GITHUB_OAUTH_EXCHANGE_URL: ${{ vars.GITHUBM_OAUTH_EXCHANGE_URL }}
         run: |
           # 注入版本号
           export VITE_APP_VERSION="1.0.${{ github.run_number }}"
@@ -192,17 +196,8 @@ jobs:
             KEY_PASS="${RELEASE_KEY_PASSWORD}"
             echo "was_generated=false" >> "$GITHUB_OUTPUT"
 
-          elif [ -f "${KEYSTORE_PATH}" ]; then
-            # ── 方案 B：使用仓库中已提交的 Keystore 文件 ──────────────
-            # 这种情况发生在用户已通过 git 提交了证书但未配置 Secret
-            echo "✅ 使用项目内置的 Release Keystore 文件"
-            STORE_PASS="GithubManager@2024"
-            KEY_ALIAS_VAL="github-manager"
-            KEY_PASS="GithubManager@2024"
-            echo "was_generated=false" >> "$GITHUB_OUTPUT"
-
           else
-            # ── 方案 C：全自动生成临时 Keystore ───────────────────
+            # ── 方案 B：全自动生成临时 Keystore ───────────────────
             echo "⚠️  未检测到 Keystore Secret 或文件，正在自动生成临时证书..."
             STORE_PASS="GithubManager@CI"
             KEY_ALIAS_VAL="github-manager"
